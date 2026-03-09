@@ -28,7 +28,6 @@ logging.basicConfig(
 logger = logging.getLogger("ensemble")
 
 # --- Configuration ---
-SNAPSHOT_IMAGE = os.environ.get("OSS_CRS_SNAPSHOT_IMAGE", "")
 HARNESS = os.environ.get("OSS_CRS_TARGET_HARNESS", "")
 BUILDER_MODULE = os.environ.get("BUILDER_MODULE", "inc-builder-asan")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
@@ -250,7 +249,6 @@ class EnsembleManager:
         self.base_test_ok = base_test_ok
         self.patches: dict[str, Patch] = {}
         self.best: Patch | None = None
-        self._last_selection_set: frozenset[str] = frozenset()
         self._state: dict = {
             "baseline": {
                 "builder_ok": True,
@@ -267,7 +265,7 @@ class EnsembleManager:
     # --- Core flow ---
 
     def handle_new_patches(self, new_files: list[str]) -> None:
-        """Validate new patches and run ensemble if validated set changed."""
+        """Validate each new patch (build + POV + test)."""
         for fname in new_files:
             if fname in self.patches:
                 continue
@@ -277,19 +275,32 @@ class EnsembleManager:
             self._validate(patch)
             self._record_patch(fname, patch)
 
-        validated = self._get_validated()
-        if validated and self._selection_set_changed(validated):
-            self._select_and_submit(validated)
-
-    def run_final_ensemble(self) -> None:
-        """Force final ensemble (called when all patch CRSes have exited)."""
-        validated = self._get_validated()
+    def select_and_submit(self) -> None:
+        """Select best patch from all validated candidates and submit. Called once at the end."""
+        validated = self.get_validated()
         if not validated:
-            logger.info("Final ensemble: no validated patches")
+            logger.info("No validated patches to select from")
             return
-        logger.info("Final ensemble: %d validated patch(es)", len(validated))
-        self._last_selection_set = frozenset()  # Force re-selection
-        self._select_and_submit(validated)
+
+        logger.info("Selecting from %d validated patch(es)", len(validated))
+
+        if len(validated) == 1:
+            selected = validated[0]
+            logger.info("Single validated patch, auto-selecting: %s", selected.path.name)
+            self._record_selection(validated, selected, "auto")
+        else:
+            selected = self._select_with_claude(validated)
+            if selected:
+                logger.info("Selector chose: %s (from %d candidates)", selected.path.name, len(validated))
+                self._record_selection(validated, selected, "claude-code")
+            else:
+                selected = validated[0]
+                logger.warning("Selector failed, falling back to: %s", selected.path.name)
+                self._record_selection(validated, selected, "fallback")
+
+        self.best = selected
+        logger.info("Submitting selected patch: %s", self.best.path.name)
+        _submit_with_retry(self.crs, DataType.PATCH, self.best.path)
 
     # --- Validation ---
 
@@ -350,35 +361,10 @@ class EnsembleManager:
             return False
         return True
 
-    def _get_validated(self) -> list[Patch]:
+    def get_validated(self) -> list[Patch]:
         return [p for p in self.patches.values() if self._is_fully_validated(p)]
 
     # --- Selection ---
-
-    def _selection_set_changed(self, validated: list[Patch]) -> bool:
-        return frozenset(p.path.name for p in validated) != self._last_selection_set
-
-    def _select_and_submit(self, validated: list[Patch]) -> None:
-        """Select best patch and submit if changed."""
-        self._last_selection_set = frozenset(p.path.name for p in validated)
-
-        if len(validated) == 1:
-            selected = validated[0]
-            logger.info("Single validated patch, auto-selecting: %s", selected.path.name)
-            self._record_selection(validated, selected, "auto")
-        else:
-            selected = self._select_with_claude(validated)
-            if selected:
-                self._record_selection(validated, selected, "claude-code")
-            else:
-                selected = validated[0]
-                logger.warning("Selector failed, falling back to first candidate")
-                self._record_selection(validated, selected, "fallback")
-
-        if self.best is None or selected.path != self.best.path:
-            self.best = selected
-            logger.info("Submitting selected patch: %s", self.best.path.name)
-            _submit_with_retry(self.crs, DataType.PATCH, self.best.path)
 
     def _select_with_claude(self, validated: list[Patch]) -> Patch | None:
         """Use Claude Code to pick the best patch from 2+ candidates."""
@@ -556,8 +542,8 @@ def fetch_povs(crs) -> list[Path]:
     )
     logger.info("Fetched %d POV(s)", len(pov_files))
     if not pov_files:
-        logger.warning("No POV files found")
-        sys.exit(0)
+        logger.error("No POV files found")
+        sys.exit(1)
     return pov_files
 
 
@@ -584,21 +570,23 @@ def setup_shared_dirs(crs) -> None:
 
 
 def _handle_ready_signal(crs, manager: EnsembleManager) -> None:
-    """All patch CRSes exited: final fetch, final ensemble."""
-    logger.info("Lifecycle ready signal received")
+    """All patch CRSes exited: wait for exchange flush, final fetch, final ensemble."""
+    logger.info("Lifecycle ready signal received, waiting %ds for exchange flush",
+                SUBMISSION_FLUSH_WAIT_SECS)
+    time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
 
     final_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
     manager.handle_new_patches(final_files)
-    manager.run_final_ensemble()
+    manager.select_and_submit()
     manager.dump_state()
 
     logger.info(
         "Final: %d patches, %d validated, best=%s",
         len(manager.patches),
-        len(manager._get_validated()),
+        len(manager.get_validated()),
         manager.best.path.name if manager.best else None,
     )
-    time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
+
     logger.info("All patch CRSes done, exiting")
 
 
@@ -607,30 +595,33 @@ def run_patch_loop(crs, manager: EnsembleManager) -> None:
     CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
 
     fetch_dir = os.environ.get("OSS_CRS_FETCH_DIR", "")
-    ready_file = Path(fetch_dir) / "status" / "ready" if fetch_dir else None
+    if not fetch_dir:
+        logger.error("OSS_CRS_FETCH_DIR is not set, cannot receive patches or ready signal")
+        sys.exit(1)
+    ready_file = Path(fetch_dir) / "status" / "ready"
 
-    logger.info("Monitoring for patches...")
-    if ready_file:
-        logger.info("Lifecycle ready signal: %s", ready_file)
+    logger.info("Monitoring for patches (ready signal: %s)", ready_file)
 
     while True:
         try:
             new_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
             manager.handle_new_patches(new_files)
+        except Exception:
+            logger.exception("Error in main loop, will retry")
 
-            if ready_file and ready_file.exists():
+        # Ready check outside try/except to prevent infinite loop on fetch errors
+        try:
+            if ready_file.exists():
                 _handle_ready_signal(crs, manager)
                 break
         except Exception:
-            logger.exception("Error in main loop, will retry")
+            logger.exception("Error handling ready signal, exiting")
+            break
         time.sleep(POLL_INTERVAL)
 
 
 def main():
     logger.info("Starting patch ensemble: harness=%s", HARNESS)
-    if not SNAPSHOT_IMAGE:
-        logger.error("OSS_CRS_SNAPSHOT_IMAGE is not set.")
-        sys.exit(1)
 
     crs = init_libcrs()
     pov_files = fetch_povs(crs)

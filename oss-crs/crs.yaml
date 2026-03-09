@@ -1,6 +1,7 @@
 name: crs-patch-ensemble
 type:
   - bug-fixing
+  - bug-fixing-ensemble
 version: 1.0.0
 docker_registry: ghcr.io/team-atlanta/crs-patch-ensemble
 

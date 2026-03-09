@@ -186,14 +186,32 @@ def reproduce_crashes(crs, pov_files: list[Path]) -> list[Path]:
     return crash_log_files
 
 
+def run_base_test(crs) -> bool:
+    """Run test suite against the base (unpatched) build.
+
+    Returns True if the base test passes. When the base test itself fails,
+    patched builds are not required to pass the test either.
+    """
+    response_dir = WORK_DIR / "base_test"
+    response_dir.mkdir(parents=True, exist_ok=True)
+    exit_code = crs.run_test("base", response_dir, BUILDER_MODULE)
+    ok = exit_code == 0
+    logger.info("Base test: exit=%d ok=%s", exit_code, ok)
+    return ok
+
+
 # --- Ensemble Manager ---
 
 
 class EnsembleManager:
-    def __init__(self, crs, pov_files: list[Path], crash_log_files: list[Path]):
+    def __init__(
+        self, crs, pov_files: list[Path],
+        crash_log_files: list[Path], base_test_ok: bool,
+    ):
         self.crs = crs
         self.pov_files = pov_files
         self.crash_log_files = crash_log_files
+        self.base_test_ok = base_test_ok
         self.patches: dict[str, Patch] = {}
         self.best: Patch | None = None
         self._last_selection_set: frozenset[str] = frozenset()
@@ -274,13 +292,22 @@ class EnsembleManager:
         return any(p.validated for p in self.patches.values())
 
     def _get_validated_patches(self) -> list[Patch]:
-        """Return patches where build + all POVs + test all passed."""
-        return [
-            p for p in self.patches.values()
-            if p.validated and p.build_ok
-            and p.pov_pass_count == p.pov_total and p.pov_total > 0
-            and p.test_ok
-        ]
+        """Return patches where build + all POVs passed, and test is acceptable.
+
+        Test is acceptable if:
+        - base test passed → patch test must also pass
+        - base test failed → patch test result is ignored (test was already broken)
+        """
+        result = []
+        for p in self.patches.values():
+            if not (p.validated and p.build_ok):
+                continue
+            if not (p.pov_pass_count == p.pov_total and p.pov_total > 0):
+                continue
+            if self.base_test_ok and not p.test_ok:
+                continue
+            result.append(p)
+        return result
 
     def _ensemble(self) -> None:
         """Select the best patch and submit it."""
@@ -500,19 +527,21 @@ def main():
     # Reproduce crashes on base build for selector context
     crash_log_files = reproduce_crashes(crs, pov_files)
 
+    # Run base test to establish baseline
+    base_test_ok = run_base_test(crs)
+
+    # Register shared dirs for post-run access (must be before mkdir)
+    claude_log_dir = Path.home() / ".claude"
+    crs.register_shared_dir(claude_log_dir, "claude-logs")
+    crs.register_shared_dir(SELECTOR_DIR, "selector")
+
     # Setup Claude Code for selector
     SELECTOR_DIR.mkdir(parents=True, exist_ok=True)
     setup_selector(SELECTOR_DIR)
 
-    # Register Claude logs and selector workdir as shared dirs for post-run access
-    claude_log_dir = Path.home() / ".claude"
-    claude_log_dir.mkdir(parents=True, exist_ok=True)
-    crs.register_shared_dir(claude_log_dir, "claude-logs")
-    crs.register_shared_dir(SELECTOR_DIR, "selector")
-
     # Main loop
     CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
-    manager = EnsembleManager(crs, pov_files, crash_log_files)
+    manager = EnsembleManager(crs, pov_files, crash_log_files, base_test_ok)
 
     logger.info("Monitoring for patches...")
 

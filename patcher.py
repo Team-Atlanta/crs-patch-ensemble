@@ -108,7 +108,6 @@ class Patch:
     pov_pass_count: int = 0
     pov_total: int = 0
     test_ok: bool = False
-    validated: bool = False
     error: str | None = None
 
 
@@ -145,11 +144,7 @@ def _submit_with_retry(crs, data_type: DataType, path: Path) -> bool:
 
 
 def setup_selector(work_dir: Path) -> None:
-    """Configure Claude Code CLI for the selector.
-
-    Sets LiteLLM proxy env vars, writes .claude.json to skip onboarding,
-    and configures global gitignore.
-    """
+    """Configure Claude Code CLI for the selector."""
     llm_api_url = os.environ.get("OSS_CRS_LLM_API_URL", "")
     llm_api_key = os.environ.get("OSS_CRS_LLM_API_KEY", "")
 
@@ -166,7 +161,6 @@ def setup_selector(work_dir: Path) -> None:
     model = SELECTOR_MODEL or os.environ.get("ANTHROPIC_MODEL", "")
     logger.info("Selector model: %s", model or "(default)")
 
-    # Write Claude JSON config to skip onboarding
     claude_config = {
         "numStartups": 0,
         "autoUpdaterStatus": "disabled",
@@ -185,7 +179,6 @@ def setup_selector(work_dir: Path) -> None:
     claude_json.chmod(0o600)
     logger.info("Wrote Claude config to %s", claude_json)
 
-    # Global gitignore so selection.json never leaks into diffs
     global_gitignore = Path.home() / ".gitignore"
     global_gitignore.write_text("selection.json\n")
     subprocess.run(
@@ -197,30 +190,10 @@ def setup_selector(work_dir: Path) -> None:
 # --- Baseline ---
 
 
-def check_base_build(crs) -> None:
-    """Verify the builder sidecar is reachable and base build exists.
-
-    Raises RuntimeError on failure — caller should exit.
-    """
-    response_dir = WORK_DIR / "base_build_check"
-    response_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        exit_code = crs.run_test("base", response_dir, BUILDER_MODULE)
-    except Exception as e:
-        raise RuntimeError(f"Builder sidecar unreachable: {e}") from e
-    if exit_code is None:
-        raise RuntimeError("Builder returned None for base build check")
-    logger.info("Base build check passed (test exit=%d)", exit_code)
-
-
 def reproduce_crashes(crs, pov_files: list[Path]) -> list[Path]:
     """Run each POV against the base build to collect crash logs.
 
-    Returns crash log file paths. Raises RuntimeError if ALL POVs fail
-    (no crash context for selector).
-
-    TODO: When there are many POVs, crash logs may be redundant. Consider
-    deduplicating via a skill or subagent before passing to the selector.
+    Returns crash log file paths. Raises RuntimeError if ALL POVs fail.
     """
     crash_log_files = []
     for i, pov_path in enumerate(pov_files):
@@ -278,168 +251,143 @@ class EnsembleManager:
         self.patches: dict[str, Patch] = {}
         self.best: Patch | None = None
         self._last_selection_set: frozenset[str] = frozenset()
-        # Incremental state for JSON dump
         self._state: dict = {
             "baseline": {
                 "builder_ok": True,
                 "base_test_ok": base_test_ok,
-                "pov_results": [],
+                "pov_results": [
+                    {"pov": p.name, "crash_log": str(l), "crash_log_exists": l.exists()}
+                    for p, l in zip(pov_files, crash_log_files)
+                ],
             },
             "patches": {},
             "ensemble_selection": None,
         }
 
-    def set_baseline_pov_results(self, pov_files: list[Path], crash_log_files: list[Path]) -> None:
-        """Record baseline POV results into state."""
-        results = []
-        for pov_path, log_path in zip(pov_files, crash_log_files):
-            results.append({
-                "pov": pov_path.name,
-                "crash_log": str(log_path),
-                "crash_log_exists": log_path.exists(),
-            })
-        self._state["baseline"]["pov_results"] = results
-
-    # --- Patch handling ---
+    # --- Core flow ---
 
     def handle_new_patches(self, new_files: list[str]) -> None:
-        """Fetch new patches, validate each, and run ensemble if needed."""
+        """Validate new patches and run ensemble if validated set changed."""
         for fname in new_files:
             if fname in self.patches:
                 continue
-            patch_path = CANDIDATE_DIR / fname
             logger.info("New candidate: %s", fname)
-
-            patch = Patch(path=patch_path, pov_total=len(self.pov_files))
+            patch = Patch(path=CANDIDATE_DIR / fname, pov_total=len(self.pov_files))
             self.patches[fname] = patch
             self._validate(patch)
             self._record_patch(fname, patch)
 
-        if self._should_ensemble():
-            self._ensemble()
+        validated = self._get_validated()
+        if validated and self._selection_set_changed(validated):
+            self._select_and_submit(validated)
 
     def run_final_ensemble(self) -> None:
         """Force final ensemble (called when all patch CRSes have exited)."""
-        validated = self._get_validated_patches()
+        validated = self._get_validated()
         if not validated:
-            logger.info("Final ensemble: no validated patches to select from")
+            logger.info("Final ensemble: no validated patches")
             return
-
         logger.info("Final ensemble: %d validated patch(es)", len(validated))
         self._last_selection_set = frozenset()  # Force re-selection
-        selected = self._ensemble_must_select(validated)
-        self._submit_if_changed(selected)
+        self._select_and_submit(validated)
 
     # --- Validation ---
 
     def _validate(self, patch: Patch) -> None:
-        """Validate a single patch. Exceptions are caught per-patch."""
+        """Build + POV + test. Exceptions skip this patch."""
         try:
-            self._validate_inner(patch)
+            # Build
+            build_dir = WORK_DIR / "validate" / patch.path.stem / "build"
+            build_dir.mkdir(parents=True, exist_ok=True)
+            build_exit = self.crs.apply_patch_build(
+                patch.path, build_dir, BUILDER_MODULE
+            )
+            if build_exit != 0:
+                logger.info("Patch %s: build failed (exit=%d)", patch.path.name, build_exit)
+                return
+
+            patch.build_ok = True
+            build_id_file = build_dir / "build_id"
+            if not build_id_file.exists():
+                logger.warning("Patch %s: build ok but no build_id", patch.path.name)
+                return
+            patch.build_id = build_id_file.read_text().strip()
+
+            # POVs — early-return on first failure
+            for pov_path in self.pov_files:
+                pov_dir = WORK_DIR / "validate" / patch.path.stem / f"pov-{pov_path.stem}"
+                pov_dir.mkdir(parents=True, exist_ok=True)
+                pov_exit = self.crs.run_pov(
+                    pov_path, HARNESS, patch.build_id, pov_dir, BUILDER_MODULE
+                )
+                passed = pov_exit == 0
+                patch.pov_results[pov_path.name] = passed
+                if passed:
+                    patch.pov_pass_count += 1
+                else:
+                    logger.info("Patch %s: POV %s failed", patch.path.name, pov_path.name)
+                    return
+
+            # Test
+            test_dir = WORK_DIR / "validate" / patch.path.stem / "test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            test_exit = self.crs.run_test(patch.build_id, test_dir, BUILDER_MODULE)
+            patch.test_ok = test_exit == 0
+
+            logger.info(
+                "Patch %s: build=%s pov=%d/%d test=%s",
+                patch.path.name, patch.build_ok,
+                patch.pov_pass_count, patch.pov_total, patch.test_ok,
+            )
         except Exception as e:
-            logger.exception("Validation failed for patch %s", patch.path.name)
+            logger.exception("Validation failed for %s", patch.path.name)
             patch.error = str(e)
-        finally:
-            patch.validated = True
-
-    def _validate_inner(self, patch: Patch) -> None:
-        """Build + POV + test. Any exception aborts this patch."""
-        # Build
-        response_dir = WORK_DIR / "validate" / patch.path.stem / "build"
-        response_dir.mkdir(parents=True, exist_ok=True)
-        build_exit = self.crs.apply_patch_build(
-            patch.path, response_dir, BUILDER_MODULE
-        )
-        if build_exit != 0:
-            logger.info("Patch %s: build failed (exit=%d)", patch.path.name, build_exit)
-            return
-
-        patch.build_ok = True
-        build_id_file = response_dir / "build_id"
-        if not build_id_file.exists():
-            logger.warning("Patch %s: build ok but no build_id", patch.path.name)
-            return
-        patch.build_id = build_id_file.read_text().strip()
-
-        # POVs — any exception aborts this patch entirely
-        for pov_path in self.pov_files:
-            pov_response = (
-                WORK_DIR / "validate" / patch.path.stem / f"pov-{pov_path.stem}"
-            )
-            pov_response.mkdir(parents=True, exist_ok=True)
-            pov_exit = self.crs.run_pov(
-                pov_path, HARNESS, patch.build_id, pov_response, BUILDER_MODULE
-            )
-            passed = pov_exit == 0
-            patch.pov_results[pov_path.name] = passed
-            if passed:
-                patch.pov_pass_count += 1
-
-        logger.info(
-            "Patch %s: POV %d/%d passed",
-            patch.path.name, patch.pov_pass_count, patch.pov_total,
-        )
-
-        # Test
-        test_response = WORK_DIR / "validate" / patch.path.stem / "test"
-        test_response.mkdir(parents=True, exist_ok=True)
-        test_exit = self.crs.run_test(patch.build_id, test_response, BUILDER_MODULE)
-        patch.test_ok = test_exit == 0
-
-        logger.info(
-            "Patch %s: validation complete (build=%s pov=%d/%d test=%s)",
-            patch.path.name, patch.build_ok,
-            patch.pov_pass_count, patch.pov_total, patch.test_ok,
-        )
 
     def _is_fully_validated(self, p: Patch) -> bool:
-        """Check if a patch passes all validation criteria."""
-        if not (p.validated and p.build_ok):
-            return False
-        if not (p.pov_pass_count == p.pov_total and p.pov_total > 0):
+        if not p.build_ok or p.pov_pass_count != p.pov_total or p.pov_total == 0:
             return False
         if self.base_test_ok and not p.test_ok:
             return False
         return True
 
-    def _get_validated_patches(self) -> list[Patch]:
-        """Return all fully validated patches."""
+    def _get_validated(self) -> list[Patch]:
         return [p for p in self.patches.values() if self._is_fully_validated(p)]
 
-    # --- Ensemble selection ---
+    # --- Selection ---
 
-    def _should_ensemble(self) -> bool:
-        """Run ensemble when the validated set changes."""
-        validated = self._get_validated_patches()
-        if not validated:
-            return False
-        current_set = frozenset(p.path.name for p in validated)
-        return current_set != self._last_selection_set
+    def _selection_set_changed(self, validated: list[Patch]) -> bool:
+        return frozenset(p.path.name for p in validated) != self._last_selection_set
 
-    def _ensemble(self) -> None:
-        """Select the best patch and submit it."""
-        validated = self._get_validated_patches()
-        if not validated:
-            logger.info("No fully validated patches, skipping ensemble")
-            return
-        selected = self._ensemble_must_select(validated)
-        self._submit_if_changed(selected)
-
-    def _ensemble_must_select(self, validated: list[Patch]) -> Patch | None:
-        """Pick the best patch: auto-select if 1, Claude Code if 2+."""
+    def _select_and_submit(self, validated: list[Patch]) -> None:
+        """Select best patch and submit if changed."""
         self._last_selection_set = frozenset(p.path.name for p in validated)
 
         if len(validated) == 1:
-            logger.info("Single validated patch, auto-selecting: %s", validated[0].path.name)
-            self._record_selection(validated, validated[0], "auto")
-            return validated[0]
+            selected = validated[0]
+            logger.info("Single validated patch, auto-selecting: %s", selected.path.name)
+            self._record_selection(validated, selected, "auto")
+        else:
+            selected = self._select_with_claude(validated)
+            if selected:
+                self._record_selection(validated, selected, "claude-code")
+            else:
+                selected = validated[0]
+                logger.warning("Selector failed, falling back to first candidate")
+                self._record_selection(validated, selected, "fallback")
 
+        if self.best is None or selected.path != self.best.path:
+            self.best = selected
+            logger.info("Submitting selected patch: %s", self.best.path.name)
+            _submit_with_retry(self.crs, DataType.PATCH, self.best.path)
+
+    def _select_with_claude(self, validated: list[Patch]) -> Patch | None:
+        """Use Claude Code to pick the best patch from 2+ candidates."""
         logger.info(
-            "Running selector on %d validated patches: %s",
+            "Running selector on %d patches: %s",
             len(validated), [p.path.name for p in validated],
         )
 
-        # Build label mapping (A, B, C, ... to avoid bias)
+        # Label mapping (A, B, C, ... to avoid bias)
         label_to_patch: dict[str, Patch] = {}
         for i, patch in enumerate(validated):
             label_to_patch[LABELS[i]] = patch
@@ -461,21 +409,12 @@ class EnsembleManager:
         valid_options = "\n".join(f"- `{label}`" for label in label_to_patch)
         prompt += SELECTION_PROMPT_FOOTER.format(valid_options=valid_options)
 
-        # Run Claude Code
-        selected = self._run_selector(prompt, label_to_patch)
-        if selected:
-            self._record_selection(validated, selected, "claude-code")
-            return selected
-
-        # Fallback
-        logger.warning("Selector failed, falling back to first candidate")
-        self._record_selection(validated, validated[0], "fallback")
-        return validated[0]
+        return self._run_selector(prompt, label_to_patch)
 
     def _run_selector(
-        self, prompt: str, label_to_patch: dict[str, Patch]
+        self, prompt: str, label_to_patch: dict[str, Patch],
     ) -> Patch | None:
-        """Invoke Claude Code CLI to select the best patch."""
+        """Invoke Claude Code CLI and parse its selection."""
         run_dir = SELECTOR_DIR / f"run_{int(time.time())}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -491,9 +430,9 @@ class EnsembleManager:
         if model:
             cmd.extend(["--model", model])
 
-        debug_log = run_dir / "claude_debug.log"
         stdout_log = run_dir / "claude_stdout.log"
         stderr_log = run_dir / "claude_stderr.log"
+        debug_log = run_dir / "claude_debug.log"
         cmd.extend(["--debug-file", str(debug_log)])
 
         logger.info("Starting selector: %s", " ".join(cmd))
@@ -552,19 +491,9 @@ class EnsembleManager:
         logger.warning("Selector returned invalid label: '%s'", selection)
         return None
 
-    # --- Submit ---
-
-    def _submit_if_changed(self, selected: Patch | None) -> None:
-        """Submit the selected patch if it differs from current best."""
-        if selected and (self.best is None or selected.path != self.best.path):
-            self.best = selected
-            logger.info("Submitting selected patch: %s", self.best.path.name)
-            _submit_with_retry(self.crs, DataType.PATCH, self.best.path)
-
-    # --- State tracking (incremental JSON) ---
+    # --- State tracking ---
 
     def _record_patch(self, fname: str, patch: Patch) -> None:
-        """Record a patch's validation result into state."""
         self._state["patches"][fname] = {
             "build_ok": patch.build_ok,
             "build_id": patch.build_id,
@@ -579,7 +508,6 @@ class EnsembleManager:
     def _record_selection(
         self, candidates: list[Patch], selected: Patch, method: str,
     ) -> None:
-        """Record an ensemble selection into state."""
         self._state["ensemble_selection"] = {
             "candidates": [p.path.name for p in candidates],
             "selected": selected.path.name,
@@ -588,14 +516,13 @@ class EnsembleManager:
         self.dump_state()
 
     def dump_state(self) -> None:
-        """Write current state to JSON file."""
         try:
             STATE_FILE.write_text(json.dumps(self._state, indent=2) + "\n")
         except Exception:
             logger.exception("Failed to write state file")
 
 
-# --- Entry point ---
+# --- Entry point functions ---
 
 
 def wait_for_builder(crs) -> bool:
@@ -635,25 +562,14 @@ def fetch_povs(crs) -> list[Path]:
 
 
 def run_baseline(crs, pov_files: list[Path]) -> tuple[list[Path], bool]:
-    """Verify builder, reproduce crashes, run base test.
-
-    Returns (crash_log_files, base_test_ok). Exits on fatal failures.
-    """
+    """Reproduce crashes and run base test. Exits on fatal failures."""
     if not wait_for_builder(crs):
         sys.exit(1)
-
-    try:
-        check_base_build(crs)
-    except RuntimeError as e:
-        logger.error("Base build check failed, exiting: %s", e)
-        sys.exit(1)
-
     try:
         crash_log_files = reproduce_crashes(crs, pov_files)
     except RuntimeError as e:
         logger.error("Crash reproduction failed, exiting: %s", e)
         sys.exit(1)
-
     base_test_ok = run_base_test(crs)
     return crash_log_files, base_test_ok
 
@@ -663,29 +579,25 @@ def setup_shared_dirs(crs) -> None:
     claude_log_dir = Path.home() / ".claude"
     crs.register_shared_dir(claude_log_dir, "claude-logs")
     crs.register_shared_dir(SELECTOR_DIR, "selector")
-
     SELECTOR_DIR.mkdir(parents=True, exist_ok=True)
     setup_selector(SELECTOR_DIR)
 
 
 def _handle_ready_signal(crs, manager: EnsembleManager) -> None:
-    """All patch CRSes exited: final fetch, final ensemble, submit state."""
+    """All patch CRSes exited: final fetch, final ensemble."""
     logger.info("Lifecycle ready signal received")
 
     final_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
     manager.handle_new_patches(final_files)
-
     manager.run_final_ensemble()
     manager.dump_state()
 
     logger.info(
         "Final: %d patches, %d validated, best=%s",
         len(manager.patches),
-        len(manager._get_validated_patches()),
+        len(manager._get_validated()),
         manager.best.path.name if manager.best else None,
     )
-
-    _submit_with_retry(crs, DataType.PATCH, STATE_FILE)
     time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
     logger.info("All patch CRSes done, exiting")
 
@@ -726,7 +638,6 @@ def main():
     setup_shared_dirs(crs)
 
     manager = EnsembleManager(crs, pov_files, crash_log_files, base_test_ok)
-    manager.set_baseline_pov_results(pov_files, crash_log_files)
     manager.dump_state()
 
     run_patch_loop(crs, manager)

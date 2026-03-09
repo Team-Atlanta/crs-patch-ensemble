@@ -668,6 +668,28 @@ def setup_shared_dirs(crs) -> None:
     setup_selector(SELECTOR_DIR)
 
 
+def _handle_ready_signal(crs, manager: EnsembleManager) -> None:
+    """All patch CRSes exited: final fetch, final ensemble, submit state."""
+    logger.info("Lifecycle ready signal received")
+
+    final_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
+    manager.handle_new_patches(final_files)
+
+    manager.run_final_ensemble()
+    manager.dump_state()
+
+    logger.info(
+        "Final: %d patches, %d validated, best=%s",
+        len(manager.patches),
+        len(manager._get_validated_patches()),
+        manager.best.path.name if manager.best else None,
+    )
+
+    _submit_with_retry(crs, DataType.PATCH, STATE_FILE)
+    time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
+    logger.info("All patch CRSes done, exiting")
+
+
 def run_patch_loop(crs, manager: EnsembleManager) -> None:
     """Main loop: fetch patches, validate, ensemble. Exits on ready signal."""
     CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -690,28 +712,6 @@ def run_patch_loop(crs, manager: EnsembleManager) -> None:
         except Exception:
             logger.exception("Error in main loop, will retry")
         time.sleep(POLL_INTERVAL)
-
-
-def _handle_ready_signal(crs, manager: EnsembleManager) -> None:
-    """All patch CRSes exited: final fetch, final ensemble, submit state."""
-    logger.info("Lifecycle ready signal received")
-
-    final_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
-    manager.handle_new_patches(final_files)
-
-    manager.run_final_ensemble()
-    manager.dump_state()
-
-    logger.info(
-        "Final: %d patches, %d validated, best=%s",
-        len(manager.patches),
-        len(manager._get_validated_patches()),
-        manager.best.path.name if manager.best else None,
-    )
-
-    _submit_with_retry(crs, DataType.PATCH, STATE_FILE)
-    time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
-    logger.info("All patch CRSes done, exiting")
 
 
 def main():

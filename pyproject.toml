@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crs-patch-ensemble"
+version = "1.0.0"
+description = "CRS patch ensemble: selects the best patch from multiple patch CRSs"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+run_patcher = "patcher:main"
+
+[tool.setuptools]
+py-modules = ["patcher"]

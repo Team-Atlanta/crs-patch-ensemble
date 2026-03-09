@@ -608,36 +608,37 @@ def wait_for_builder(crs) -> bool:
         return False
 
 
-def main():
-    logger.info("Starting patch ensemble: harness=%s", HARNESS)
-
-    if not SNAPSHOT_IMAGE:
-        logger.error("OSS_CRS_SNAPSHOT_IMAGE is not set.")
-        sys.exit(1)
-
+def init_libcrs():
+    """Initialize libCRS and register submission directory."""
     crs = init_crs_utils()
-
-    # Register patch submission directory
     PATCHES_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(
         target=crs.register_submit_dir,
         args=(DataType.PATCH, PATCHES_DIR),
         daemon=True,
     ).start()
+    return crs
 
-    # Fetch POVs
-    pov_files_fetched = crs.fetch(DataType.POV, POV_DIR)
-    logger.info("Fetched %d POV(s)", len(pov_files_fetched))
+
+def fetch_povs(crs) -> list[Path]:
+    """Fetch POV files from exchange. Exits if none found."""
+    crs.fetch(DataType.POV, POV_DIR)
     pov_files = sorted(
         f for f in POV_DIR.rglob("*")
         if f.is_file() and not f.name.startswith(".")
     )
+    logger.info("Fetched %d POV(s)", len(pov_files))
     if not pov_files:
         logger.warning("No POV files found")
         sys.exit(0)
+    return pov_files
 
-    # --- Baseline: verify builder, reproduce crashes, run base test ---
 
+def run_baseline(crs, pov_files: list[Path]) -> tuple[list[Path], bool]:
+    """Verify builder, reproduce crashes, run base test.
+
+    Returns (crash_log_files, base_test_ok). Exits on fatal failures.
+    """
     if not wait_for_builder(crs):
         sys.exit(1)
 
@@ -654,9 +655,11 @@ def main():
         sys.exit(1)
 
     base_test_ok = run_base_test(crs)
+    return crash_log_files, base_test_ok
 
-    # --- Setup selector and shared dirs ---
 
+def setup_shared_dirs(crs) -> None:
+    """Register shared dirs and configure Claude Code selector."""
     claude_log_dir = Path.home() / ".claude"
     crs.register_shared_dir(claude_log_dir, "claude-logs")
     crs.register_shared_dir(SELECTOR_DIR, "selector")
@@ -664,12 +667,10 @@ def main():
     SELECTOR_DIR.mkdir(parents=True, exist_ok=True)
     setup_selector(SELECTOR_DIR)
 
-    # --- Main loop ---
 
+def run_patch_loop(crs, manager: EnsembleManager) -> None:
+    """Main loop: fetch patches, validate, ensemble. Exits on ready signal."""
     CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
-    manager = EnsembleManager(crs, pov_files, crash_log_files, base_test_ok)
-    manager.set_baseline_pov_results(pov_files, crash_log_files)
-    manager.dump_state()
 
     fetch_dir = os.environ.get("OSS_CRS_FETCH_DIR", "")
     ready_file = Path(fetch_dir) / "status" / "ready" if fetch_dir else None
@@ -684,27 +685,51 @@ def main():
             manager.handle_new_patches(new_files)
 
             if ready_file and ready_file.exists():
-                logger.info("Lifecycle ready signal received")
-                # Final fetch + validate round
-                final_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
-                manager.handle_new_patches(final_files)
-                # Force final selection
-                manager.run_final_ensemble()
-                manager.dump_state()
-                logger.info(
-                    "Final: %d patches, %d validated, best=%s",
-                    len(manager.patches),
-                    len(manager._get_validated_patches()),
-                    manager.best.path.name if manager.best else None,
-                )
-                # Submit state as artifact
-                _submit_with_retry(crs, DataType.PATCH, STATE_FILE)
-                time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
-                logger.info("All patch CRSes done, exiting")
+                _handle_ready_signal(crs, manager)
                 break
         except Exception:
             logger.exception("Error in main loop, will retry")
         time.sleep(POLL_INTERVAL)
+
+
+def _handle_ready_signal(crs, manager: EnsembleManager) -> None:
+    """All patch CRSes exited: final fetch, final ensemble, submit state."""
+    logger.info("Lifecycle ready signal received")
+
+    final_files = crs.fetch(DataType.PATCH, CANDIDATE_DIR)
+    manager.handle_new_patches(final_files)
+
+    manager.run_final_ensemble()
+    manager.dump_state()
+
+    logger.info(
+        "Final: %d patches, %d validated, best=%s",
+        len(manager.patches),
+        len(manager._get_validated_patches()),
+        manager.best.path.name if manager.best else None,
+    )
+
+    _submit_with_retry(crs, DataType.PATCH, STATE_FILE)
+    time.sleep(SUBMISSION_FLUSH_WAIT_SECS)
+    logger.info("All patch CRSes done, exiting")
+
+
+def main():
+    logger.info("Starting patch ensemble: harness=%s", HARNESS)
+    if not SNAPSHOT_IMAGE:
+        logger.error("OSS_CRS_SNAPSHOT_IMAGE is not set.")
+        sys.exit(1)
+
+    crs = init_libcrs()
+    pov_files = fetch_povs(crs)
+    crash_log_files, base_test_ok = run_baseline(crs, pov_files)
+    setup_shared_dirs(crs)
+
+    manager = EnsembleManager(crs, pov_files, crash_log_files, base_test_ok)
+    manager.set_baseline_pov_results(pov_files, crash_log_files)
+    manager.dump_state()
+
+    run_patch_loop(crs, manager)
 
 
 if __name__ == "__main__":

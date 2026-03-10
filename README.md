@@ -84,7 +84,7 @@ Requirements:
 ```
 crs-patch-ensemble/
 ├── oss-crs/
-│   ├── crs.yaml              # CRS config (type: bug-fixing + bug-fixing-ensemble)
+│   ├── crs.yaml              # CRS config (type: bug-fixing-ensemble)
 │   ├── docker-bake.hcl       # Build config
 │   ├── base.Dockerfile       # Ubuntu + Python + Node.js + Claude Code CLI
 │   ├── builder.Dockerfile    # Target builder

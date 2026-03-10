@@ -2,6 +2,13 @@
 
 Patch ensemble CRS for OSS-CRS. Collects patches from other bug-fixing CRSes, validates each (build + POV + test), and uses Claude Code to select the best fix when multiple candidates pass.
 
+## Interface
+
+The ensemble CRS interacts with the framework through two channels:
+
+- **Patch monitoring** — Polls the exchange directory (`OSS_CRS_FETCH_DIR`) for patches submitted by other bug-fixing CRSes
+- **Ready signal** — Expects `$OSS_CRS_FETCH_DIR/status/ready` to appear when all patch CRSes have exited, signaling that no more patches will arrive and ensemble selection should begin (currently provided by the lifecycle sidecar in oss-crs-infra)
+
 ## How it works
 
 ```mermaid
@@ -9,8 +16,8 @@ graph TD
     A[Startup: fetch POVs, reproduce crashes, run base test] --> B[Poll for patches from exchange]
     B --> C{New patch?}
     C -->|Yes| D[Validate: build → POV → test]
-    D --> B
-    C -->|No| E{All patch CRSes exited?}
+    D --> E{Ready signal?}
+    C -->|No| E
     E -->|No| B
     E -->|Yes| F[Wait for exchange flush]
     F --> G[Final fetch + validate]
@@ -28,18 +35,15 @@ Currently implements **must-select**: when all patch CRSes have finished, the en
 ## Usage
 
 ```yaml
-# Patch CRSes — must set attach: false
 patch-crs-a:
   cpuset: "4-11"
   memory: "16G"
-  attach: false
   additional_env:
     ANTHROPIC_MODEL: claude-sonnet-4-6
 
 patch-crs-b:
   cpuset: "12-19"
   memory: "16G"
-  attach: false
 
 # Ensemble CRS
 crs-patch-ensemble:
@@ -60,9 +64,10 @@ llm_config:
 ```
 
 Requirements:
-- Patch CRSes must set `attach: false` (prevents `--abort-on-container-exit` from killing the ensemble)
-- Exchange must be enabled (automatic when multiple CRSes are present)
-- LLM config required for the Claude Code selector
+- At least one other bug-fixing CRS in the compose
+- Exchange enabled (automatic when multiple CRSes are present)
+- LLM config for the Claude Code selector
+
 
 ## Environment variables
 
